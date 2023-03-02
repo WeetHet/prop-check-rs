@@ -1,5 +1,5 @@
 use crate::gen::{Gen, SGen};
-use crate::rng::RNG;
+use crate::rng::PropRng;
 
 use anyhow::*;
 use itertools::Unfold;
@@ -54,7 +54,7 @@ impl PropResult {
     }
   }
 
-  pub fn to_result(self) -> Result<String> {
+  pub fn into_result(self) -> Result<String> {
     match self {
       p @ PropResult::Passed { .. } => Ok(p.message()),
       p @ PropResult::Proved => Ok(p.message()),
@@ -62,12 +62,11 @@ impl PropResult {
     }
   }
 
-  pub fn to_result_unit(self) -> Result<()> {
+  pub fn into_result_unit(self) -> Result<()> {
     self
-      .to_result()
+      .into_result()
       .map(|msg| {
         log::info!("{}", msg);
-        ()
       })
       .map_err(|err| {
         log::error!("{}", err);
@@ -96,7 +95,8 @@ impl IsFalsified for PropResult {
   }
 }
 
-fn random_stream<A>(g: Gen<A>, rng: RNG) -> Unfold<RNG, Box<dyn FnMut(&mut RNG) -> Option<A>>>
+type DynOptFn<T, A> = dyn FnMut(&mut T) -> Option<A>;
+fn random_stream<T: PropRng, A>(g: Gen<T, A>, rng: T) -> Unfold<T, Box<DynOptFn<T, A>>>
 where
   A: Clone + 'static, {
   itertools::unfold(
@@ -110,7 +110,7 @@ where
 }
 
 /// Represents the function to evaluate the properties by using SGens.
-pub fn for_all_sgen<A, F, FF>(sgen: SGen<A>, mut f: FF) -> Prop
+pub fn for_all_sgen<T: PropRng, A, F, FF>(sgen: SGen<T, A>, mut f: FF) -> Prop<T>
 where
   F: FnMut(A) -> bool + 'static,
   FF: FnMut() -> F + 'static,
@@ -122,9 +122,9 @@ where
 }
 
 /// Represents the function to evaluate the properties by using Gens.
-pub fn for_all_gen_for_size<A, GF, F, FF>(gf: GF, mut f: FF) -> Prop
+pub fn for_all_gen_for_size<T: PropRng + 'static, A, GF, F, FF>(gf: GF, mut f: FF) -> Prop<T>
 where
-  GF: Fn(u32) -> Gen<A> + 'static,
+  GF: Fn(u32) -> Gen<T, A> + 'static,
   F: FnMut(A) -> bool + 'static,
   FF: FnMut() -> F + 'static,
   A: Clone + Debug + 'static, {
@@ -146,13 +146,13 @@ where
 }
 
 /// Represents the function to evaluate the properties by using Gens.
-pub fn for_all_gen<A, F>(g: Gen<A>, mut test: F) -> Prop
+pub fn for_all_gen<T: PropRng, A, F>(g: Gen<T, A>, mut test: F) -> Prop<T>
 where
   F: FnMut(A) -> bool + 'static,
   A: Clone + Debug + 'static, {
   Prop {
     run_f: Rc::new(RefCell::new(move |_, n, rng| {
-      let success_counter = itertools::iterate(1, |&i| i + 1).into_iter();
+      let success_counter = itertools::iterate(1, |&i| i + 1);
       random_stream(g.clone(), rng)
         .zip(success_counter)
         .take(n as usize)
@@ -179,19 +179,27 @@ where
 /// * `max_size` - The maximum size of the generated value.
 /// * `test_cases` - The number of test cases.
 /// * `rng` - The random number generator.
-pub fn run_with_prop(p: Prop, max_size: MaxSize, test_cases: TestCases, rng: RNG) -> Result<String> {
-  p.run(max_size, test_cases, rng).to_result()
+pub fn run_with_prop<T: PropRng>(p: Prop<T>, max_size: MaxSize, test_cases: TestCases, rng: T) -> Result<String> {
+  p.run(max_size, test_cases, rng).into_result()
 }
 
-pub fn test_with_prop(p: Prop, max_size: MaxSize, test_cases: TestCases, rng: RNG) -> Result<()> {
-  p.run(max_size, test_cases, rng).to_result_unit()
+/// Test the Prop.
+///
+/// # Arguments
+///
+/// * `max_size` - The maximum size of the generated value.
+/// * `test_cases` - The number of test cases.
+/// * `rng` - The random number generator.
+pub fn test_with_prop<T: PropRng>(p: Prop<T>, max_size: MaxSize, test_cases: TestCases, rng: T) -> Result<()> {
+  p.run(max_size, test_cases, rng).into_result_unit()
 }
 
-pub struct Prop {
-  run_f: Rc<RefCell<dyn FnMut(MaxSize, TestCases, RNG) -> PropResult>>,
+type DynProp<T> = dyn FnMut(MaxSize, TestCases, T) -> PropResult;
+pub struct Prop<T: PropRng> {
+  run_f: Rc<RefCell<DynProp<T>>>,
 }
 
-impl Clone for Prop {
+impl<T: PropRng> Clone for Prop<T> {
   fn clone(&self) -> Self {
     Self {
       run_f: self.run_f.clone(),
@@ -199,21 +207,21 @@ impl Clone for Prop {
   }
 }
 
-impl Prop {
-  pub fn new<F>(f: F) -> Prop
+impl<T: PropRng> Prop<T> {
+  pub fn new<F>(f: F) -> Prop<T>
   where
-    F: Fn(MaxSize, TestCases, RNG) -> PropResult + 'static, {
+    F: Fn(MaxSize, TestCases, T) -> PropResult + 'static, {
     Prop {
       run_f: Rc::new(RefCell::new(f)),
     }
   }
 
-  pub fn run(&self, max_size: MaxSize, test_cases: TestCases, rng: RNG) -> PropResult {
+  pub fn run(&self, max_size: MaxSize, test_cases: TestCases, rng: T) -> PropResult {
     let mut f = self.run_f.borrow_mut();
     f(max_size, test_cases, rng)
   }
 
-  pub fn tag(self, msg: String) -> Prop {
+  pub fn tag(self, msg: String) -> Prop<T> {
     Prop::new(move |max, n, rng| match self.run(max, n, rng) {
       PropResult::Falsified {
         failure: e,
@@ -226,18 +234,17 @@ impl Prop {
     })
   }
 
-  /// .
-  pub fn and(self, other: Self) -> Prop {
+  pub fn and(self, other: Self) -> Prop<T> {
     Self::new(
-      move |max: MaxSize, n: TestCases, rng: RNG| match self.run(max, n, rng.clone()) {
+      move |max: MaxSize, n: TestCases, rng: T| match self.run(max, n, rng.clone()) {
         PropResult::Passed { .. } | PropResult::Proved => other.run(max, n, rng),
         x => x,
       },
     )
   }
 
-  pub fn or(self, p: Self) -> Prop {
-    Self::new(move |max, n, rng: RNG| match self.run(max, n, rng.clone()) {
+  pub fn or(self, p: Self) -> Prop<T> {
+    Self::new(move |max, n, rng: T| match self.run(max, n, rng.clone()) {
       PropResult::Falsified { failure: msg, .. } => p.clone().tag(msg).run(max, n, rng),
       x => x,
     })
@@ -251,16 +258,13 @@ mod tests {
 
   use super::*;
   use anyhow::Result;
+  use crate::rand::thread_rng;
   use std::env;
 
   #[ctor::ctor]
   fn init() {
     env::set_var("RUST_LOG", "info");
     let _ = env_logger::builder().is_test(true).try_init();
-  }
-
-  fn new_rng() -> RNG {
-    RNG::new()
   }
 
   #[test]
@@ -270,7 +274,7 @@ mod tests {
       log::info!("value = {}", a);
       true
     });
-    test_with_prop(prop, 1, 100, new_rng())
+    test_with_prop(prop, 1, 100, thread_rng())
   }
 
   #[test]
@@ -287,6 +291,6 @@ mod tests {
         }
       },
     );
-    test_with_prop(prop, 10, 100, new_rng())
+    test_with_prop(prop, 10, 100, thread_rng())
   }
 }
